@@ -39,6 +39,16 @@ vec nnlsCpp(const mat &A, const vec &b, int max_iter = 500, double tol = 1e-6, b
   return x;
 }
 
+arma::cube myreshape(arma::mat A, arma::uword n, arma::uword q, arma::uword r){
+  arma::cube X         = zeros(r, q, n);
+  arma::uvec idq       = regspace<uvec>(0, q - 1);
+  for(uword i = 0; i < n; i++){
+    X.slice(i) = A.cols(idq);
+    idq        = idq + ones<uvec>(q, 1)*q;
+  }
+  return(X);
+}
+
 //[[Rcpp::export]]
 arma::vec FCLS(arma::mat M, arma::vec y, arma::mat Sigma, arma::uword p, arma::uword q){
   arma::mat Qq;
@@ -58,7 +68,6 @@ arma::vec FCLS(arma::mat M, arma::vec y, arma::mat Sigma, arma::uword p, arma::u
   arma::vec   u         = nnlsCpp(E, f);
   arma::vec   r         = E*u - f;
   arma::vec   z;        
-  //Rcpp::Rcout << "r: " << r(p*q) << std::endl;
   if(r(p*q) == 0){
     z         = -r.head(p*q)/(-1e-16);
   } else {
@@ -81,10 +90,12 @@ List FCLS_Rep(arma::mat M, arma::cube Y, double eps = 1e-6){
   arma::uword q         = Y.n_cols;
   arma::uword n         = Y.n_slices;
   arma::uword nIter     = 0;
-  arma::uword maxIter   = 200;
-  //double      eps       = 1e-6;
+  arma::uword maxIter   = 2e3;
   double      diff      = 1;
-  double      diff2     = 10;
+  double      c         = 1;
+  double      ttime     = 0;
+  clock_t 	  start;
+  clock_t     end;
   arma::mat   Mtilde    = kron(eye(q, q), M);
   arma::mat   Omega     = eye(r, r)*100;
   arma::mat   Phi       = eye(q, q)*100;
@@ -106,31 +117,113 @@ List FCLS_Rep(arma::mat M, arma::cube Y, double eps = 1e-6){
   arma::mat   AsympVar;
   arma::vec   se;
   arma::mat   tmp;
-  while((std::abs(diff - diff2) > eps) & (nIter < maxIter)){
+  /* Start timing */
+  start 				= clock();
+	while( (diff > eps) & (nIter < maxIter)){
     R         = zeros(r, r);
     S         = zeros(q, q);
     ThetaOld  = Theta;
     for(uword i = 0; i < n; i++){
       y               = vectorise(Y.slice(i));
       tmp             = FCLS(Mtilde, y, Sigma_12, p, q);
-      //Rcpp::Rcout << trans(tmp) << "i: " << i << std::endl; 
       thetahat        = reshape(tmp, p, q);
       Theta.slice(i)  = thetahat; 
       Residual        = Y.slice(i) - M*Theta.slice(i);
       S               = S + Residual.t()*OmegaInv*Residual;
       R               = R + Residual*PhiInv*Residual.t();
     }
-    //Rcpp::Rcout << "Theta: " << is_finite(Theta) << std::endl;
     Phi               = S/(n*r);
     Omega             = R/(n*q);
-    PhiInv            = inv(Phi);
+	  c                 = 1/(trace(Phi)/q);
+    PhiInv            = inv(Phi*c);
     OmegaInv          = inv(Omega);
     SigmaInv          = kron(PhiInv, OmegaInv);
     eig_sym(eigval, eigvec, SigmaInv);
     Sigma_12          = eigvec.t()*diagmat(sqrt(eigval));
     nIter             = nIter + 1;
-    diff2             = diff;
-    diff              = accu(pow(Theta - ThetaOld, 2))/(n*p*q);
+    diff              = accu(abs(Theta - ThetaOld));
+  }
+  end 				        = clock();
+  ttime               = ((double) (end - start)) / CLOCKS_PER_SEC;
+  AsympVar            = inv(Mtilde.t()*SigmaInv*Mtilde);
+  se                  = sqrt(AsympVar.diag()); 
+  /* Printing message to console */
+  Rcpp::Rcout << "                                               " << std::endl;
+  Rcpp::Rcout << " Done! " << std::endl;
+  Rcpp::Rcout << "                                               " << std::endl;
+  Rcpp::Rcout << " Convergence criterion achieved (" << std::fixed << eps << ")" << std::endl;
+  Rcpp::Rcout << nIter << " iterations in " << std::fixed << ttime << " seconds" << std::endl;
+  /* Saving output */
+  Out["Theta"]        = Theta;
+  Out["s.e."]         = se;
+  Out["Iterations"]   = nIter;
+  Out["Time"]         = ttime;
+  return(Out);
+}
+
+//[[Rcpp::export]] 
+List FCLS_NRM(arma::mat M, arma::cube Y, arma::mat Ginv, double eps = 1e-6){
+  arma::uword r         = M.n_rows;
+  arma::uword p         = M.n_cols;
+  arma::uword q         = Y.n_cols;
+  arma::uword n         = Y.n_slices;
+  arma::uword nIter     = 0;
+  arma::uword maxIter   = 2e3;
+  double      diff      = 1;
+  double      c         = 1;
+  arma::mat   Mtilde    = kron(eye(q*n, q*n), M);
+  arma::mat   Omega     = eye(r, r)*100;
+  arma::mat   Phi       = eye(q, q)*100;
+  arma::mat   OmegaInv  = eye(r, r)*0.001;
+  arma::mat   PhiInv    = eye(q, q)*0.001;
+  arma::mat   SigmaInv  = kron(Ginv, kron(PhiInv, OmegaInv));
+  arma::cube  Theta     = randu(p, q, n);
+  arma::cube  ThetaOld  = randu(p, q, n);
+  arma::cube  ResC      = zeros(q, r, n);
+  arma::cube  ResR      = zeros(r, q, n);
+  arma::mat   Er;
+  arma::mat   Ec;
+  arma::vec   eigval;
+  arma::mat   eigvec;
+  eig_sym(eigval, eigvec, SigmaInv);
+  arma::mat   Sigma_12  = diagmat(sqrt(eigval));
+  Rcpp::List  Out;
+  arma::mat   R;
+  arma::mat   S;
+  arma::vec   y;
+  arma::mat   thetahat;
+  arma::mat   Residual;
+  arma::mat   AsympVar;
+  arma::vec   se;
+  arma::mat   tmp;
+  while((diff > eps) & (nIter < maxIter)){
+    R         = zeros(r, r);
+    S         = zeros(q, q);
+    ThetaOld  = Theta;
+	y         = vectorise(Y);
+	thetahat  = FCLS(Mtilde, y, Sigma_12, p, q*n);
+	Theta     = myreshape(thetahat, n, q, p);
+	ResC      = zeros(q, r, n);
+	ResR      = zeros(r, q, n);
+    for(uword i = 0; i < n; i++){
+      Residual        = Y.slice(i) - M*Theta.slice(i);
+	  ResR.slice(i)   = Residual;
+	  ResC.slice(i)   = Residual.t();
+    }
+	Er                = reshape(ResR, r, q*n, 1);
+	Ec                = reshape(ResC, q, r*n, 1);
+	S                 = Ec*kron(Ginv, OmegaInv)*Ec.t();
+	R                 = Er*kron(Ginv, PhiInv)*Er.t();
+    Phi               = S/(n*r);
+	c                 = 1/(trace(Phi)/q);
+    PhiInv            = inv(Phi*c);
+    Omega             = R/(n*q);
+    OmegaInv          = inv(Omega);
+    SigmaInv          = kron(PhiInv, OmegaInv);
+    eig_sym(eigval, eigvec, SigmaInv);
+    Sigma_12          = eigvec.t()*diagmat(sqrt(eigval));
+    nIter             = nIter + 1;
+    diff              = accu(abs(Theta - ThetaOld));
   }
   AsympVar            = inv(Mtilde.t()*SigmaInv*Mtilde);
   se                  = sqrt(AsympVar.diag()); 
